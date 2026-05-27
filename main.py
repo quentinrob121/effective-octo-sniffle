@@ -7,6 +7,8 @@ Usage:
     python main.py orders
     python main.py buy AAPL 1            # market order (paper)
     python main.py buy AAPL 1 --limit 150
+    python main.py sell AAPL 1           # market sell (paper)
+    python main.py sell AAPL 1 --limit 160
     python main.py bracket AAPL 1 --take-profit 200 --stop-loss 140
     python main.py stop AAPL 1 --stop-price 140
     python main.py positions
@@ -70,18 +72,24 @@ def cmd_orders(_: argparse.Namespace) -> None:
               f"{order.order_type}  status={order.status}")
 
 
-def cmd_buy(args: argparse.Namespace) -> None:
+def _submit_directional(args: argparse.Namespace, side: OrderSide) -> None:
     client = build_trading_client()
     if args.limit is not None:
         order = submit_limit_order(
-            client, args.symbol, args.qty, args.limit, side=OrderSide.BUY
+            client, args.symbol, args.qty, args.limit, side=side
         )
     else:
-        order = submit_market_order(
-            client, args.symbol, args.qty, side=OrderSide.BUY
-        )
+        order = submit_market_order(client, args.symbol, args.qty, side=side)
     print(f"Submitted {order.side} {order.qty} {order.symbol} "
           f"(id={order.id}, status={order.status})")
+
+
+def cmd_buy(args: argparse.Namespace) -> None:
+    _submit_directional(args, OrderSide.BUY)
+
+
+def cmd_sell(args: argparse.Namespace) -> None:
+    _submit_directional(args, OrderSide.SELL)
 
 
 def cmd_bracket(args: argparse.Namespace) -> None:
@@ -156,6 +164,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_buy.add_argument("--limit", type=float, default=None,
                        help="Limit price (omit for a market order)")
     p_buy.set_defaults(func=cmd_buy)
+
+    p_sell = sub.add_parser("sell", help="Submit a sell order (paper)")
+    p_sell.add_argument("symbol")
+    p_sell.add_argument("qty", type=float)
+    p_sell.add_argument("--limit", type=float, default=None,
+                        help="Limit price (omit for a market order)")
+    p_sell.set_defaults(func=cmd_sell)
 
     p_bracket = sub.add_parser("bracket", help="Bracket order: entry + TP + SL")
     p_bracket.add_argument("symbol")

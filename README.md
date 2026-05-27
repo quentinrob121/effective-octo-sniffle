@@ -37,6 +37,8 @@ python main.py bars AAPL          # recent daily bars
 python main.py orders             # list open orders
 python main.py buy AAPL 1         # market buy, 1 share (paper)
 python main.py buy AAPL 1 --limit 150
+python main.py sell AAPL 1        # market sell (paper)
+python main.py sell AAPL 1 --limit 160
 
 # Bracket order: entry + take-profit + stop-loss legs
 python main.py bracket AAPL 1 --take-profit 200 --stop-loss 140
@@ -77,6 +79,8 @@ pytest
 ```
 
 The suite mocks the Alpaca clients, so it runs offline and needs no API keys.
+GitHub Actions runs it on every push and pull request across Python 3.10–3.12
+(see `.github/workflows/ci.yml`).
 
 ## Note on market data
 

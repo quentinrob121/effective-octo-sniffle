@@ -26,6 +26,13 @@ def test_market_order_request_built():
     assert req.side == OrderSide.BUY
 
 
+def test_market_order_honors_sell_side():
+    req = _captured_request(
+        orders.submit_market_order, "AAPL", 2, side=OrderSide.SELL
+    )
+    assert req.side == OrderSide.SELL
+
+
 def test_stop_order_defaults_to_sell():
     req = _captured_request(orders.submit_stop_order, "AAPL", 1, 140)
     assert isinstance(req, StopOrderRequest)
