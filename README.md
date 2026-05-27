@@ -37,6 +37,21 @@ python main.py bars AAPL          # recent daily bars
 python main.py orders             # list open orders
 python main.py buy AAPL 1         # market buy, 1 share (paper)
 python main.py buy AAPL 1 --limit 150
+
+# Bracket order: entry + take-profit + stop-loss legs
+python main.py bracket AAPL 1 --take-profit 200 --stop-loss 140
+python main.py bracket AAPL 1 --take-profit 200 --stop-loss 140 --stop-limit 139
+
+# Standalone protective stop (sell)
+python main.py stop AAPL 1 --stop-price 140
+
+# Positions
+python main.py positions          # list open positions
+python main.py close AAPL         # close a single position
+python main.py close --all        # close every position (cancels open orders)
+
+# Live trade feed over websockets (Ctrl+C to stop)
+python main.py stream AAPL MSFT
 ```
 
 ## Layout
@@ -47,9 +62,21 @@ alpaca_starter/
   client.py        # builds Trading and Market-Data clients
   account.py       # account info helpers
   market_data.py   # quotes and historical bars
-  orders.py        # market/limit orders, list/cancel
+  orders.py        # market/limit/stop/trailing-stop/bracket, list/cancel
+  positions.py     # list, summarize, close one / close all
+  stream.py        # live websocket trade feed
 main.py            # demo CLI tying it together
+tests/             # pytest suite (mocked clients, no network)
 ```
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+The suite mocks the Alpaca clients, so it runs offline and needs no API keys.
 
 ## Note on market data
 

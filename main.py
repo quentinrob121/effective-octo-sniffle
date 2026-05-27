@@ -7,6 +7,12 @@ Usage:
     python main.py orders
     python main.py buy AAPL 1            # market order (paper)
     python main.py buy AAPL 1 --limit 150
+    python main.py bracket AAPL 1 --take-profit 200 --stop-loss 140
+    python main.py stop AAPL 1 --stop-price 140
+    python main.py positions
+    python main.py close AAPL            # close one position
+    python main.py close --all          # close every position
+    python main.py stream AAPL MSFT     # live trade feed (Ctrl+C to stop)
 """
 
 from __future__ import annotations
@@ -20,9 +26,17 @@ from alpaca_starter.account import account_summary
 from alpaca_starter.market_data import latest_quote, recent_daily_bars
 from alpaca_starter.orders import (
     list_open_orders,
+    submit_bracket_order,
     submit_limit_order,
     submit_market_order,
+    submit_stop_order,
 )
+from alpaca_starter.positions import (
+    close_all_positions,
+    close_position,
+    position_summary,
+)
+from alpaca_starter.stream import stream_trades
 
 
 def cmd_account(_: argparse.Namespace) -> None:
@@ -70,6 +84,56 @@ def cmd_buy(args: argparse.Namespace) -> None:
           f"(id={order.id}, status={order.status})")
 
 
+def cmd_bracket(args: argparse.Namespace) -> None:
+    client = build_trading_client()
+    order = submit_bracket_order(
+        client,
+        args.symbol,
+        args.qty,
+        take_profit_price=args.take_profit,
+        stop_loss_price=args.stop_loss,
+        stop_loss_limit_price=args.stop_limit,
+    )
+    print(f"Submitted bracket {order.qty} {order.symbol} "
+          f"(id={order.id}, status={order.status})")
+
+
+def cmd_stop(args: argparse.Namespace) -> None:
+    client = build_trading_client()
+    order = submit_stop_order(client, args.symbol, args.qty, args.stop_price)
+    print(f"Submitted stop {order.side} {order.qty} {order.symbol} "
+          f"@ {args.stop_price} (id={order.id}, status={order.status})")
+
+
+def cmd_positions(_: argparse.Namespace) -> None:
+    client = build_trading_client()
+    rows = position_summary(client)
+    if not rows:
+        print("No open positions.")
+        return
+    for row in rows:
+        print(f"{row['symbol']:>6}  {row['side']:>5}  qty {row['qty']}  "
+              f"@ {row['avg_entry_price']}  now {row['current_price']}  "
+              f"P/L {row['unrealized_pl']} ({row['unrealized_plpc']})")
+
+
+def cmd_close(args: argparse.Namespace) -> None:
+    client = build_trading_client()
+    if args.all:
+        results = close_all_positions(client, cancel_orders=True)
+        print(f"Submitted close for {len(results)} position(s).")
+        return
+    if not args.symbol:
+        raise SystemExit("Provide a symbol or use --all.")
+    order = close_position(client, args.symbol)
+    print(f"Closing {args.symbol} (order id={order.id}, status={order.status})")
+
+
+def cmd_stream(args: argparse.Namespace) -> None:
+    print(f"Streaming trades for {', '.join(args.symbols)} (Ctrl+C to stop)...")
+    stream_trades(args.symbols)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Alpaca paper-trading starter")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -92,6 +156,36 @@ def build_parser() -> argparse.ArgumentParser:
     p_buy.add_argument("--limit", type=float, default=None,
                        help="Limit price (omit for a market order)")
     p_buy.set_defaults(func=cmd_buy)
+
+    p_bracket = sub.add_parser("bracket", help="Bracket order: entry + TP + SL")
+    p_bracket.add_argument("symbol")
+    p_bracket.add_argument("qty", type=float)
+    p_bracket.add_argument("--take-profit", type=float, required=True,
+                           help="Take-profit limit price")
+    p_bracket.add_argument("--stop-loss", type=float, required=True,
+                           help="Stop-loss trigger price")
+    p_bracket.add_argument("--stop-limit", type=float, default=None,
+                           help="Optional stop-loss limit price (stop-limit leg)")
+    p_bracket.set_defaults(func=cmd_bracket)
+
+    p_stop = sub.add_parser("stop", help="Standalone protective stop (sell)")
+    p_stop.add_argument("symbol")
+    p_stop.add_argument("qty", type=float)
+    p_stop.add_argument("--stop-price", type=float, required=True)
+    p_stop.set_defaults(func=cmd_stop)
+
+    sub.add_parser("positions", help="List open positions").set_defaults(
+        func=cmd_positions
+    )
+
+    p_close = sub.add_parser("close", help="Close one position or all")
+    p_close.add_argument("symbol", nargs="?", default=None)
+    p_close.add_argument("--all", action="store_true", help="Close every position")
+    p_close.set_defaults(func=cmd_close)
+
+    p_stream = sub.add_parser("stream", help="Live trade feed (websocket)")
+    p_stream.add_argument("symbols", nargs="+")
+    p_stream.set_defaults(func=cmd_stream)
 
     return parser
 

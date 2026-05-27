@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
 from alpaca.trading.models import Order
 from alpaca.trading.requests import (
     GetOrdersRequest,
     LimitOrderRequest,
     MarketOrderRequest,
+    StopLossRequest,
+    StopOrderRequest,
+    TakeProfitRequest,
+    TrailingStopOrderRequest,
 )
 
 
@@ -40,6 +44,78 @@ def submit_limit_order(
         side=side,
         time_in_force=time_in_force,
         limit_price=limit_price,
+    )
+    return client.submit_order(request)
+
+
+def submit_stop_order(
+    client: TradingClient,
+    symbol: str,
+    qty: float,
+    stop_price: float,
+    side: OrderSide = OrderSide.SELL,
+    time_in_force: TimeInForce = TimeInForce.DAY,
+) -> Order:
+    """A standalone stop order — typically a protective sell on an open position."""
+    request = StopOrderRequest(
+        symbol=symbol,
+        qty=qty,
+        side=side,
+        time_in_force=time_in_force,
+        stop_price=stop_price,
+    )
+    return client.submit_order(request)
+
+
+def submit_trailing_stop_order(
+    client: TradingClient,
+    symbol: str,
+    qty: float,
+    trail_percent: float | None = None,
+    trail_price: float | None = None,
+    side: OrderSide = OrderSide.SELL,
+    time_in_force: TimeInForce = TimeInForce.DAY,
+) -> Order:
+    """Trailing stop. Provide exactly one of trail_percent or trail_price."""
+    if (trail_percent is None) == (trail_price is None):
+        raise ValueError("Provide exactly one of trail_percent or trail_price.")
+    request = TrailingStopOrderRequest(
+        symbol=symbol,
+        qty=qty,
+        side=side,
+        time_in_force=time_in_force,
+        trail_percent=trail_percent,
+        trail_price=trail_price,
+    )
+    return client.submit_order(request)
+
+
+def submit_bracket_order(
+    client: TradingClient,
+    symbol: str,
+    qty: float,
+    take_profit_price: float,
+    stop_loss_price: float,
+    stop_loss_limit_price: float | None = None,
+    side: OrderSide = OrderSide.BUY,
+    time_in_force: TimeInForce = TimeInForce.GTC,
+) -> Order:
+    """Entry market order bracketed by a take-profit and a stop-loss leg.
+
+    If stop_loss_limit_price is given the protective leg is a stop-limit,
+    otherwise a plain stop.
+    """
+    request = MarketOrderRequest(
+        symbol=symbol,
+        qty=qty,
+        side=side,
+        time_in_force=time_in_force,
+        order_class=OrderClass.BRACKET,
+        take_profit=TakeProfitRequest(limit_price=take_profit_price),
+        stop_loss=StopLossRequest(
+            stop_price=stop_loss_price,
+            limit_price=stop_loss_limit_price,
+        ),
     )
     return client.submit_order(request)
 
