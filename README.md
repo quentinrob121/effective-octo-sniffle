@@ -82,6 +82,53 @@ The suite mocks the Alpaca clients, so it runs offline and needs no API keys.
 GitHub Actions runs it on every push and pull request across Python 3.10–3.12
 (see `.github/workflows/ci.yml`).
 
+## Copy-trading bot (politician mirror)
+
+`copy_trading_bot/` mirrors a congressional politician's disclosed trades from
+[Capitol Trades](https://www.capitoltrades.com/) into your Alpaca account.
+
+**Defaults** (override via env vars — see `.env.example`):
+
+- Target: **Tim Moore (R-NC, House)** — Capitol Trades' highest-volume active
+  trader at the time of setup (200+ trades, stocks only, recent activity).
+- Sizing: **$500 per copied buy** (mirrored sells close the held position).
+- Mode: **paper** (so long as `ALPACA_BASE_URL` is the paper endpoint).
+
+### Important caveats
+
+- **Disclosures lag the actual trade by up to 45 days** (STOCK Act rules).
+  This is a delayed signal, not a live front-run.
+- **Options trades are dropped.** Capitol Trades rarely discloses strike or
+  expiry, so faithful options copying isn't possible. Tim Moore trades stocks
+  only, so this is moot for the default target.
+- **Non-US-listed tickers are dropped** (e.g. `:GB`, `:DE`).
+- **Sell signals close the held position**; the bot never shorts.
+
+### CLI
+
+```bash
+python -m copy_trading_bot preview            # show scraped trades, do nothing
+python -m copy_trading_bot run --dry-run      # decide + log, no orders
+python -m copy_trading_bot run                # actually mirror
+```
+
+### Scheduling (GitHub Actions)
+
+`.github/workflows/copy-trade.yml` runs the bot hourly during US market hours
+on a cron schedule and commits `copy_trading_bot/state/processed_trades.json`
+back to the branch so processed disclosures aren't replayed. To enable it:
+
+1. Repo **Settings → Secrets and variables → Actions** → add secrets
+   `ALPACA_API_KEY`, `ALPACA_API_SECRET` (and optionally `ALPACA_BASE_URL`).
+2. Optionally override the politician or sizing via repo **Variables**:
+   `COPY_POLITICIAN_ID`, `COPY_POLITICIAN_NAME`, `COPY_TRADE_USD`,
+   `COPY_MAX_TRADE_USD`.
+3. Trigger a one-off run from the **Actions** tab → *Copy Trade* →
+   *Run workflow* (toggle "Preview only" for a dry run).
+
+A locally-installed cron is intentionally *not* provided — running the bot
+from a laptop means it stops working as soon as the laptop sleeps.
+
 ## Note on market data
 
 Quotes and bars use Alpaca's free IEX feed by default. With only IEX data,
