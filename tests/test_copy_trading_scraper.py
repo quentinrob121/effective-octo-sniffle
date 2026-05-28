@@ -67,5 +67,27 @@ def test_chronological_orders_oldest_first():
     assert ordered[0].traded_date <= ordered[-1].traded_date
 
 
+def test_chronological_puts_buy_before_sell_on_same_day():
+    """Same-day round-trips: sell must come AFTER its buy so the executor
+    can find the position before trying to close it."""
+    from datetime import date
+
+    from copy_trading_bot.models import PoliticianTrade
+
+    same_day = date(2026, 5, 1)
+    buy = PoliticianTrade(
+        politician_id="X", politician_name="X", ticker="NVDA", issuer="X",
+        traded_date=same_day, published_date=same_day,
+        tx_type="buy", size_range="15K-50K", price=100.0,
+    )
+    sell = PoliticianTrade(
+        politician_id="X", politician_name="X", ticker="NVDA", issuer="X",
+        traded_date=same_day, published_date=same_day,
+        tx_type="sell", size_range="15K-50K", price=110.0,
+    )
+    # Feed in the wrong order; expect buy first out.
+    assert [t.tx_type for t in chronological([sell, buy])] == ["buy", "sell"]
+
+
 def test_parse_empty_html():
     assert parse_trades("<html></html>", "X", "X") == []

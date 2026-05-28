@@ -19,6 +19,9 @@ class PoliticianTrade:
 
     @property
     def signature(self) -> str:
+        # Intentionally excludes price: Capitol Trades occasionally amends a
+        # disclosed price (corrections, post-hoc adjustments) and we don't
+        # want such an amendment to look like a brand-new trade and re-fire.
         raw = "|".join(
             [
                 self.politician_id,
@@ -26,7 +29,6 @@ class PoliticianTrade:
                 self.traded_date.isoformat(),
                 self.tx_type,
                 self.size_range,
-                f"{self.price:.4f}" if self.price is not None else "na",
             ]
         )
         return hashlib.sha1(raw.encode()).hexdigest()[:16]

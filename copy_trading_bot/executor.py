@@ -32,11 +32,16 @@ class ExecutionResult:
 
 
 def _safe_get_position_qty(client: TradingClient, symbol: str) -> float:
+    """Return 0 only when Alpaca explicitly says we have no position (404).
+    Any other error (rate limit, 5xx, timeout, auth) must propagate — silently
+    treating those as "no position" would mark the sell processed and never
+    retry, leaving us long a stock the politician already exited."""
     try:
         position = client.get_open_position(symbol)
-    except APIError:
-        # Alpaca returns 404 when no position exists.
-        return 0.0
+    except APIError as exc:
+        if getattr(exc, "status_code", None) == 404:
+            return 0.0
+        raise
     try:
         return float(position.qty_available or position.qty)
     except (TypeError, ValueError):
@@ -97,8 +102,9 @@ def _drop_ladder_under(
     ref_price: float,
     config: CopyTraderConfig,
 ) -> None:
-    """Drop a dip-ladder under a fresh mirror-buy. Failures are logged but
-    never propagate — the mirror-buy already succeeded."""
+    """Drop a dip-ladder under a fresh mirror-buy. Must not propagate: the
+    mirror-buy already succeeded, and if we raise the caller never records
+    the trade in state — the next cron run would re-buy."""
     ladder_cfg = LadderConfig(max_total_usd=config.ladder_max_total_usd)
     try:
         placed = place_ladder(
@@ -109,8 +115,8 @@ def _drop_ladder_under(
             config=ladder_cfg,
             dry_run=config.dry_run,
         )
-    except ValueError as exc:
-        log.warning("ladder plan rejected for %s: %s", symbol, exc)
+    except Exception as exc:  # noqa: BLE001 - intentionally broad; see docstring
+        log.warning("ladder failed for %s: %s", symbol, exc)
         return
     for p in placed:
         log.info(

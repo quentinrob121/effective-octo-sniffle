@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import dataclasses
 import logging
 from datetime import date, timedelta
 
@@ -46,7 +45,6 @@ def run_once(config: CopyTraderConfig | None = None) -> list[ExecutionResult]:
     quote_source = AlpacaQuoteSource(build_data_client())
 
     results: list[ExecutionResult] = []
-    audit_entries: list[dict] = []
     for trade in new_trades:
         result = execute(trade, trading_client, quote_source, config)
         log.info(
@@ -59,21 +57,25 @@ def run_once(config: CopyTraderConfig | None = None) -> list[ExecutionResult]:
         )
         results.append(result)
         if result.action != "error":
-            # Record skipped + submitted so we don't keep retrying.
-            entry = {
-                "signature": trade.signature,
-                "ticker": trade.ticker,
-                "type": trade.tx_type,
-                "traded_date": trade.traded_date.isoformat(),
-                "size_range": trade.size_range,
-                "action": result.action,
-                "detail": result.detail,
-                "order_id": result.order_id,
-            }
-            audit_entries.append(entry)
+            # Persist immediately. If the loop crashes after this point we must
+            # NOT replay a trade we already submitted, even at the cost of an
+            # extra file write per iteration.
+            append_processed([_audit_entry(trade, result)])
 
-    append_processed(audit_entries)
     return results
+
+
+def _audit_entry(trade, result) -> dict:
+    return {
+        "signature": trade.signature,
+        "ticker": trade.ticker,
+        "type": trade.tx_type,
+        "traded_date": trade.traded_date.isoformat(),
+        "size_range": trade.size_range,
+        "action": result.action,
+        "detail": result.detail,
+        "order_id": result.order_id,
+    }
 
 
 def summarize(results: list[ExecutionResult]) -> str:
@@ -86,5 +88,3 @@ def summarize(results: list[ExecutionResult]) -> str:
 
 # Re-export for tests
 __all__ = ["run_once", "summarize", "ExecutionResult"]
-
-_ = dataclasses  # silence linters that flag unused-import patterns

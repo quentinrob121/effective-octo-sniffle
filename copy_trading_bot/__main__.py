@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import os
 import sys
+
+from dotenv import load_dotenv
 
 from .bot import run_once, summarize
 from .config import load_config
@@ -20,7 +23,7 @@ def _setup_logging(verbose: bool) -> None:
 def cmd_run(args: argparse.Namespace) -> int:
     config = load_config()
     if args.dry_run:
-        config = config.__class__(**{**config.__dict__, "dry_run": True})  # type: ignore[arg-type]
+        config = dataclasses.replace(config, dry_run=True)
     results = run_once(config)
     print(summarize(results))
     return 0
@@ -61,7 +64,11 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     _setup_logging(args.verbose)
-    # Default endpoint is paper; only warn if the user explicitly set a non-paper URL.
+    # Resolve .env first so a .env-supplied paper URL isn't flagged as live.
+    # The underlying alpaca-py client routes by the `paper` boolean
+    # (alpaca_starter.client.build_trading_client), which is derived from
+    # ALPACA_BASE_URL — so this *is* the source of truth.
+    load_dotenv()
     base_url = os.getenv("ALPACA_BASE_URL")
     if base_url and "paper-api" not in base_url:
         logging.getLogger("copy_trading_bot").warning(

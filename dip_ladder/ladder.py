@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-import time
+import uuid
 from dataclasses import dataclass
 
 from alpaca.common.exceptions import APIError
@@ -23,11 +23,11 @@ class PlacedRung:
     client_order_id: str | None = None
 
 
-def _client_order_id(symbol: str, ref_price: float, idx: int) -> str:
-    # Stays under Alpaca's 48-char client_order_id limit. Suffix with ms-time
-    # so re-running on the same ref price doesn't collide.
-    ts = int(time.time() * 1000) % 10_000_000
-    return f"{LADDER_CLIENT_ID_PREFIX}-{symbol[:6]}-{int(ref_price)}-{idx}-{ts}"
+def _client_order_id(symbol: str, idx: int) -> str:
+    """Random suffix so re-runs never collide. Stays under Alpaca's 48-char
+    client_order_id limit."""
+    suffix = uuid.uuid4().hex[:10]
+    return f"{LADDER_CLIENT_ID_PREFIX}-{symbol[:8]}-{idx}-{suffix}"
 
 
 def place_ladder(
@@ -47,7 +47,7 @@ def place_ladder(
     )
     placed: list[PlacedRung] = []
     for idx, rung in enumerate(plan):
-        coid = _client_order_id(symbol, ref_price, idx)
+        coid = _client_order_id(symbol, idx)
         if dry_run:
             placed.append(
                 PlacedRung(

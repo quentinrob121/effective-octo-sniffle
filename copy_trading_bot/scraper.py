@@ -107,6 +107,11 @@ def fetch_trades(
 
 
 def chronological(trades: Iterable[PoliticianTrade]) -> list[PoliticianTrade]:
-    """Capitol Trades returns newest-first; we want oldest-first for processing
-    so buys precede their corresponding sells when applicable."""
-    return sorted(trades, key=lambda t: (t.traded_date, t.published_date))
+    """Capitol Trades returns newest-first; we want oldest-first so a buy and
+    its later sell are processed in the right order. Ties on traded_date break
+    by tx_type with buys first — same-day round-trips would otherwise leave
+    us trying to sell a position we haven't opened yet."""
+    return sorted(
+        trades,
+        key=lambda t: (t.traded_date, 0 if t.tx_type == "buy" else 1, t.published_date),
+    )
