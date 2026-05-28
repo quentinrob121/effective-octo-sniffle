@@ -10,6 +10,8 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
 
+from dip_ladder import LadderConfig, place_ladder
+
 from .config import CopyTraderConfig
 from .models import PoliticianTrade
 
@@ -83,7 +85,40 @@ def execute(
         return ExecutionResult(
             trade, "skipped", f"{symbol} @ ${price:.2f} > budget ${budget:.0f}"
         )
-    return _submit(client, symbol, qty, side, trade, config, reason="mirror-buy")
+    result = _submit(client, symbol, qty, side, trade, config, reason="mirror-buy")
+    if result.action == "submitted" and config.enable_ladder:
+        _drop_ladder_under(client, symbol, ref_price=price, config=config)
+    return result
+
+
+def _drop_ladder_under(
+    client: TradingClient,
+    symbol: str,
+    ref_price: float,
+    config: CopyTraderConfig,
+) -> None:
+    """Drop a dip-ladder under a fresh mirror-buy. Failures are logged but
+    never propagate — the mirror-buy already succeeded."""
+    ladder_cfg = LadderConfig(max_total_usd=config.ladder_max_total_usd)
+    try:
+        placed = place_ladder(
+            client=client,
+            symbol=symbol,
+            ref_price=ref_price,
+            base_usd=config.trade_usd,
+            config=ladder_cfg,
+            dry_run=config.dry_run,
+        )
+    except ValueError as exc:
+        log.warning("ladder plan rejected for %s: %s", symbol, exc)
+        return
+    for p in placed:
+        log.info(
+            "LADDER %-9s -%.0f%% %s",
+            p.action.upper(),
+            p.rung.level_pct * 100,
+            p.detail,
+        )
 
 
 def _submit(

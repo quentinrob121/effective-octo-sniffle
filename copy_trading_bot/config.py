@@ -31,6 +31,10 @@ class CopyTraderConfig:
     page_size: int
     dry_run: bool
     skip_older_than_days: int  # ignore disclosures with a traded-date older than this
+    # If true, every successful mirror-buy also drops a dip-ladder of GTC
+    # limit buys at -15/-25/-35/-50% with 1:2:3:5 sizing. See dip_ladder/.
+    enable_ladder: bool = False
+    ladder_max_total_usd: float = 30_000.0
 
     @property
     def politician_url(self) -> str:
@@ -52,4 +56,7 @@ def load_config() -> CopyTraderConfig:
         page_size=int(os.getenv("COPY_PAGE_SIZE", DEFAULT_PAGE_SIZE)),
         dry_run=os.getenv("COPY_DRY_RUN", "false").lower() in ("1", "true", "yes"),
         skip_older_than_days=int(os.getenv("COPY_SKIP_OLDER_THAN_DAYS", "90")),
+        enable_ladder=os.getenv("COPY_ENABLE_LADDER", "false").lower()
+        in ("1", "true", "yes"),
+        ladder_max_total_usd=float(os.getenv("COPY_LADDER_MAX_USD", "30000")),
     )

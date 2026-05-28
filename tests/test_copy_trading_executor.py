@@ -111,3 +111,21 @@ def test_alpaca_error_returns_error_result():
     res = execute(_trade(tx="buy", price=50.0), client, _Quotes(50.0), _config())
     assert res.action == "error"
     assert "rejected" in res.detail
+
+
+def test_buy_drops_ladder_when_enabled():
+    client = MagicMock()
+    client.submit_order.return_value = MagicMock(id="abc")
+    config = _config(enable_ladder=True, trade_usd=500.0)
+    res = execute(_trade(tx="buy", price=100.0), client, _Quotes(100.0), config)
+    assert res.action == "submitted"
+    # 1 mirror buy + 4 ladder rungs = 5 submitted orders.
+    assert client.submit_order.call_count == 5
+
+
+def test_buy_does_not_drop_ladder_when_disabled():
+    client = MagicMock()
+    client.submit_order.return_value = MagicMock(id="abc")
+    config = _config(enable_ladder=False)
+    execute(_trade(tx="buy", price=100.0), client, _Quotes(100.0), config)
+    assert client.submit_order.call_count == 1

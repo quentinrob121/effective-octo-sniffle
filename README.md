@@ -129,6 +129,44 @@ back to the branch so processed disclosures aren't replayed. To enable it:
 A locally-installed cron is intentionally *not* provided — running the bot
 from a laptop means it stops working as soon as the laptop sleeps.
 
+## Dip-buying ladder (`dip_ladder/`)
+
+A separate, scale-in-on-dips helper: place GTC limit buys at -15%, -25%,
+-35%, -50% off a reference price, with 1:2:3:5 sizing (deeper dips =
+bigger adds). The ladder is just GTC limit orders, so it needs no daemon
+— Alpaca fills the rungs when (if) price gets there.
+
+### Standalone CLI
+
+```bash
+# Preview only (also works without ALPACA creds when --ref-price is set)
+python -m dip_ladder plan NFLX --ref-price 360 --base-shares 10
+
+# Place the ladder (uses the live quote if --ref-price is omitted)
+python -m dip_ladder place NFLX --base-shares 10
+python -m dip_ladder place NVDA --base-usd 500 --ref-price 175
+
+# Custom geometry
+python -m dip_ladder place TSLA --base-shares 5 \
+    --levels 10,20,30,40,50 --weights 1,2,3,4,5
+
+# Inspect / tear down
+python -m dip_ladder status
+python -m dip_ladder status NFLX
+python -m dip_ladder cancel NFLX
+```
+
+Ladder orders are tagged via Alpaca's `client_order_id` (`ladder-<sym>-…`),
+so `status` and `cancel` only touch ladder rungs — they leave your other
+orders alone.
+
+### Plugged into the copy-trader
+
+Set `COPY_ENABLE_LADDER=true` (env or repo variable). After every
+successful mirror-buy, the bot drops a ladder under it sized off the
+mirror's own dollar budget. `COPY_LADDER_MAX_USD` caps the cumulative
+notional per ladder.
+
 ## Note on market data
 
 Quotes and bars use Alpaca's free IEX feed by default. With only IEX data,
