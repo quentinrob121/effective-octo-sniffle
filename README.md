@@ -195,6 +195,78 @@ python -m position_manager cancel            # cancel all managed orders
 market hours. The op is idempotent (no-op when the stop already exists),
 so over-scheduling is harmless.
 
+## Wheel bot (`wheel_bot/`)
+
+Runs the classic options "wheel" strategy on a configurable basket of
+tickers: sell cash-secured puts, take assignment if they finish ITM, sell
+covered calls against the assigned shares, repeat. The bot tracks every
+ticker's stage (`IDLE`/`PUT_OPEN`/`HOLDING`/`CALL_OPEN`/`DISABLED`) in
+`wheel_bot/state/wheel_state.json`, persists after every order, and
+reconciles against Alpaca on each run so that an assignment or call-away
+that happens between cron ticks is picked up automatically.
+
+**Hard correctness rules** (designed around past failure modes):
+
+- **Cash-secured guard**: before every put STO, subtracts collateral
+  already reserved by *every* open put (wheel-tagged or not) from options
+  buying power; refuses if the result can't cover the new put's notional.
+- **Never below basis**: covered calls won't be sold at a strike below
+  the effective per-share basis (avg cost minus call premium already
+  collected against the same lot).
+- **Per-trade durability**: state is saved immediately after every
+  successful order so a mid-loop crash never replays an STO.
+- **Adopt pre-existing positions**: if a ticker is `IDLE` in state but
+  has equity at Alpaca on first run, the bot adopts the position into
+  `HOLDING` using Alpaca's `avg_entry_price` as basis (and logs a
+  warning so you can override via `wheel_bot adopt`).
+- **Deeply underwater = HOLD**: when every available call strike sits
+  below basis, the lot stays in `HOLDING` and is surfaced in the daily
+  summary rather than being sold for a loss.
+
+### CLI
+
+```bash
+python -m wheel_bot status                  # state per ticker
+python -m wheel_bot status PLTR             # one ticker
+python -m wheel_bot run --dry-run           # one full cycle, no orders
+python -m wheel_bot run                     # one full cycle (live)
+python -m wheel_bot summary                 # write today's markdown summary
+python -m wheel_bot close PLTR              # force BTC the open wheel contract
+python -m wheel_bot pause PLTR              # stop opening new positions
+python -m wheel_bot resume PLTR
+python -m wheel_bot reset PLTR              # wipe local state for ticker
+python -m wheel_bot adopt PLTR --basis 38.5 --shares 100
+```
+
+### Scheduling
+
+`.github/workflows/wheel.yml` runs every 15 min during US market hours
+(`*/15 13-21 * * 1-5` UTC, covering both EDT and EST). After each run it
+commits `wheel_bot/state/` back to the branch (state file, audit log,
+daily summary) with the same pull-rebase + retry pattern used by the
+copy-trade workflow. The commit step runs `if: always()` so partial state
+writes from a mid-loop crash still get persisted.
+
+### Caveats
+
+- **Options L3 required** — the Alpaca account must be approved for
+  selling cash-secured puts and covered calls. Paper accounts can be
+  upgraded for free in the dashboard.
+- **Free IEX option data is sparse off-hours**. The bot will simply skip
+  a ticker for the cycle if the chain comes back empty rather than
+  guessing.
+- **NANC has monthly options only**. The DTE-window picker returns
+  `None` rather than picking a 40-DTE monthly when the target is 21-DTE,
+  so NANC gets STO'd at most ~once a month, and only when the cron tick
+  lands inside the window.
+- **STO orders use GTC limits at the bid**. They may not fill instantly;
+  the next cron tick won't double-submit because state is updated as
+  soon as Alpaca accepts the order, regardless of fill.
+- **BTC uses market orders**. Once we've decided the contract is decayed
+  enough to close, parking a GTC limit at ask risks the option expiring
+  unfilled. The decision gate guarantees we only do this when the cost
+  is below the configured profit target.
+
 ## Note on market data
 
 Quotes and bars use Alpaca's free IEX feed by default. With only IEX data,

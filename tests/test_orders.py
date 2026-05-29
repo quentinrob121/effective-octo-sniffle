@@ -2,8 +2,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from alpaca.trading.enums import OrderClass, OrderSide
+from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
 from alpaca.trading.requests import (
+    LimitOrderRequest,
     MarketOrderRequest,
     StopOrderRequest,
 )
@@ -63,6 +64,57 @@ def test_bracket_order_stop_limit_leg():
         stop_loss_limit_price=139,
     )
     assert float(req.stop_loss.limit_price) == 139
+
+
+def test_option_market_order_defaults_to_gtc():
+    # Option decisions are made off-hours by cron, so DAY would be rejected.
+    req = _captured_request(
+        orders.submit_option_market_order,
+        "PLTR250620P00040000",
+        1,
+        OrderSide.SELL,
+    )
+    assert isinstance(req, MarketOrderRequest)
+    assert req.symbol == "PLTR250620P00040000"
+    assert req.side == OrderSide.SELL
+    assert req.time_in_force == TimeInForce.GTC
+
+
+def test_option_market_order_passes_client_order_id():
+    req = _captured_request(
+        orders.submit_option_market_order,
+        "PLTR250620P00040000",
+        1,
+        OrderSide.BUY,
+        client_order_id="wheel-PLTR-btc-abcd1234",
+    )
+    assert req.client_order_id == "wheel-PLTR-btc-abcd1234"
+
+
+def test_option_limit_order_carries_price_and_gtc():
+    req = _captured_request(
+        orders.submit_option_limit_order,
+        "PLTR250620C00045000",
+        1,
+        OrderSide.SELL,
+        limit_price=1.25,
+    )
+    assert isinstance(req, LimitOrderRequest)
+    assert req.symbol == "PLTR250620C00045000"
+    assert float(req.limit_price) == 1.25
+    assert req.time_in_force == TimeInForce.GTC
+
+
+def test_option_limit_order_passes_client_order_id():
+    req = _captured_request(
+        orders.submit_option_limit_order,
+        "PLTR250620P00040000",
+        1,
+        OrderSide.SELL,
+        limit_price=0.50,
+        client_order_id="wheel-PLTR-put-deadbeef",
+    )
+    assert req.client_order_id == "wheel-PLTR-put-deadbeef"
 
 
 def test_trailing_stop_requires_exactly_one_trail_arg():
