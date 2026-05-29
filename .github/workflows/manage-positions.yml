@@ -1,0 +1,58 @@
+name: Manage Positions
+
+# Walks every open position and attaches a trailing-stop SELL if it lacks one.
+# Idempotent: subsequent runs are no-ops once a position already has a stop.
+# Alpaca trails the stop server-side as the high-water mark advances, so we
+# don't need to keep "tightening" — placing once is enough.
+
+on:
+  schedule:
+    # Twice an hour during US market hours, covering both EDT and EST. The
+    # checks are idempotent and cheap, so a wider window costs nothing.
+    - cron: "*/30 13-21 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Preview only - do not place orders"
+        type: boolean
+        default: false
+      reentry_pct:
+        description: "% below current price for the re-entry GTC limit buy (0 = off)"
+        default: "0"
+
+concurrency:
+  group: manage-positions
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  manage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run position manager
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
+          ALPACA_BASE_URL: ${{ secrets.ALPACA_BASE_URL || 'https://paper-api.alpaca.markets/v2' }}
+          PSMGR_TRAIL_PCT: ${{ vars.PSMGR_TRAIL_PCT || '10' }}
+          PSMGR_REENTRY_PCT: ${{ inputs.reentry_pct || vars.PSMGR_REENTRY_PCT || '0' }}
+          PSMGR_REENTRY_USD: ${{ vars.PSMGR_REENTRY_USD || '500' }}
+          PSMGR_DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+        run: python -m position_manager -v run

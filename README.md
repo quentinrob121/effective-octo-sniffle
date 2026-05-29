@@ -167,6 +167,34 @@ successful mirror-buy, the bot drops a ladder under it sized off the
 mirror's own dollar budget. `COPY_LADDER_MAX_USD` caps the cumulative
 notional per ladder.
 
+## Position manager (`position_manager/`)
+
+Walks every open long position and, if it has no protective SELL order
+attached, places a trailing-stop SELL at `PSMGR_TRAIL_PCT`% below the high-
+water mark. Alpaca trails the stop server-side, so "moving the floor up"
+happens automatically — this module's job is just to make sure the trailing
+stop *exists* on every position.
+
+Optionally, set `PSMGR_REENTRY_PCT > 0` to also drop a GTC limit BUY
+`reentry_pct`% below the current price (re-enters automatically if the
+stop fires and price recovers to the bid).
+
+### CLI
+
+```bash
+python -m position_manager run --dry-run     # show what'd happen
+python -m position_manager run               # attach stops
+python -m position_manager status            # list managed orders
+python -m position_manager cancel AAPL       # cancel managed orders for AAPL
+python -m position_manager cancel            # cancel all managed orders
+```
+
+### Scheduling
+
+`.github/workflows/manage-positions.yml` runs every 30 min during US
+market hours. The op is idempotent (no-op when the stop already exists),
+so over-scheduling is harmless.
+
 ## Note on market data
 
 Quotes and bars use Alpaca's free IEX feed by default. With only IEX data,
