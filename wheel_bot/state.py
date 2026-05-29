@@ -12,6 +12,7 @@ STATE_DIR = Path(__file__).parent / "state"
 STATE_PATH = STATE_DIR / "wheel_state.json"
 AUDIT_PATH = STATE_DIR / "audit.jsonl"
 SUMMARIES_DIR = STATE_DIR / "summaries"
+PENDING_INTENTS_PATH = STATE_DIR / "pending_intents.json"
 
 
 class Stage(str, enum.Enum):
@@ -95,37 +96,57 @@ class WheelState:
 
 
 def load_state(path: Path = STATE_PATH) -> WheelState:
+    """Load state, backing up corrupt files instead of silently dropping data.
+
+    A corrupted JSON file is a real operational signal — silently returning
+    an empty state would let the reconciler re-STO on top of forgotten open
+    positions. We rename the bad file to ``<name>.corrupt-<utc-ts>`` so an
+    operator can inspect it, and return empty so the reconciler can adopt
+    any real Alpaca positions on the next run.
+    """
     if not path.exists():
         return WheelState()
     try:
         data = json.loads(path.read_text())
     except (json.JSONDecodeError, OSError):
-        # A truncated/garbled state file would otherwise wedge the bot.
-        # Start fresh — reconciler will adopt any real Alpaca positions on
-        # the next run.
+        try:
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            backup = path.with_suffix(path.suffix + f".corrupt-{ts}")
+            os.replace(path, backup)
+        except OSError:
+            pass  # best-effort; the load still has to succeed
         return WheelState()
     return WheelState.from_dict(data)
 
 
-def save_state(state: WheelState, path: Path = STATE_PATH) -> None:
-    """Atomic write: temp file + os.replace so a mid-write crash leaves the
-    old file intact rather than producing a half-written JSON we can't parse."""
+def _atomic_write_json(path: Path, payload: str) -> None:
+    """Temp-file + fsync + os.replace. The fsync is necessary because
+    ``os.replace`` only guarantees atomicity at the directory-entry level —
+    on a power loss between write() and rename() the new file could exist
+    with zero bytes. fsync forces the new contents to disk first."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(state.to_dict(), indent=2, sort_keys=True) + "\n"
     fd, tmp = tempfile.mkstemp(
-        prefix=".wheel_state.", suffix=".json.tmp", dir=str(path.parent)
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
     )
     try:
         with os.fdopen(fd, "w") as f:
             f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
     except Exception:
-        # Best-effort cleanup; never let the cleanup mask the original error.
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
+
+
+def save_state(state: WheelState, path: Path = STATE_PATH) -> None:
+    """Atomic write of state JSON. See ``_atomic_write_json`` for the
+    durability guarantees."""
+    payload = json.dumps(state.to_dict(), indent=2, sort_keys=True) + "\n"
+    _atomic_write_json(path, payload)
 
 
 def append_audit(entry: dict, path: Path = AUDIT_PATH) -> None:
@@ -136,3 +157,62 @@ def append_audit(entry: dict, path: Path = AUDIT_PATH) -> None:
     entry.setdefault("ts", datetime.now(timezone.utc).isoformat(timespec="seconds"))
     with path.open("a") as f:
         f.write(json.dumps(entry, sort_keys=True) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Pending-intent journal (orphan-order recovery)
+# ---------------------------------------------------------------------------
+#
+# The wheel executor's failure mode we're guarding against:
+#   1. We submit STO put to Alpaca -> succeeds, order_id assigned.
+#   2. We mutate state in memory.
+#   3. We call save_state(...) -> raises (disk full, etc).
+# At this point the order EXISTS at Alpaca but state still shows IDLE. The
+# next cron tick would re-STO and we'd have TWO short puts on the same name.
+#
+# The journal pattern:
+#   - Before submitting, write {ticker, intent, contract, client_order_id} to
+#     pending_intents.json.
+#   - Submit. Persist state. Then clear the intent.
+#   - On startup, ``recover_orphan_intents`` (in reconciler.py) inspects the
+#     journal, queries Alpaca for each client_order_id, and reconciles any
+#     orders that exist but aren't reflected in state.
+
+def load_pending_intents(path: Path = PENDING_INTENTS_PATH) -> list[dict]:
+    """Return the list of in-flight intents (empty if file missing/corrupt)."""
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return data
+
+
+def _write_pending_intents(intents: list[dict], path: Path = PENDING_INTENTS_PATH) -> None:
+    payload = json.dumps(intents, indent=2, sort_keys=True) + "\n"
+    _atomic_write_json(path, payload)
+
+
+def journal_intent(intent: dict, path: Path = PENDING_INTENTS_PATH) -> None:
+    """Append ``intent`` to the journal BEFORE submitting an order. Must
+    include at minimum a ``client_order_id`` so recovery can match it."""
+    if "client_order_id" not in intent:
+        raise ValueError("intent must include 'client_order_id'")
+    intents = load_pending_intents(path)
+    intents.append(dict(intent))
+    _write_pending_intents(intents, path)
+
+
+def clear_intent(client_order_id: str, path: Path = PENDING_INTENTS_PATH) -> None:
+    """Remove the intent matching ``client_order_id`` from the journal.
+
+    Called after state has been persisted; a no-op if the intent is missing
+    (which can happen if recovery already cleaned it up)."""
+    intents = load_pending_intents(path)
+    remaining = [i for i in intents if i.get("client_order_id") != client_order_id]
+    if len(remaining) == len(intents):
+        return  # nothing to remove
+    _write_pending_intents(remaining, path)

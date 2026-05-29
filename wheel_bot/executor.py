@@ -6,18 +6,14 @@ from datetime import date
 
 from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
-from alpaca.trading.requests import GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
 
 from alpaca_starter import make_coid
-from alpaca_starter.orders import (
-    submit_option_limit_order,
-    submit_option_market_order,
-)
+from alpaca_starter.orders import submit_option_limit_order
 
 from .config import WHEEL_PREFIX, WheelConfig
 from .option_picker import OptionCandidate
-from .state import Stage, TickerState
+from .state import Stage, TickerState, clear_intent, journal_intent
 
 log = logging.getLogger("wheel_bot.executor")
 
@@ -35,66 +31,22 @@ class ExecAction:
 # Cash-secured guard
 # ---------------------------------------------------------------------------
 
-def _is_put_sell(order) -> bool:
-    """Heuristic: an option SELL order whose OCC symbol marks it as a put.
-
-    Used so we can subtract collateral reserved by puts we didn't tag (e.g.
-    legacy positions opened by hand or by another tool). The check is
-    structural — we don't trust asset_class because some SDK responses omit
-    it; the OCC symbol shape is the authoritative signal.
-    """
-    try:
-        side = OrderSide(str(order.side).split(".")[-1].lower())
-    except Exception:  # noqa: BLE001
-        return False
-    if side is not OrderSide.SELL:
-        return False
-    symbol = getattr(order, "symbol", "") or ""
-    if len(symbol) < 15:
-        return False
-    # OCC format: ROOT(YYMMDD)(C|P)(STRIKE8). The C/P byte is at index -9 of
-    # the full symbol. We check that exact byte (not "P anywhere in the tail")
-    # so 'PLTR' calls aren't misread as puts.
-    return symbol[-9] == "P"
-
-
-def _put_collateral(order, fallback_strike: float) -> float:
-    """Collateral reserved by an open put SELL: strike * 100 * qty.
-
-    The strike comes from the OCC symbol's trailing 8-digit
-    strike-in-thousandths field — that's the authoritative source.
-    ``limit_price`` on a SELL is the *premium per share*, not the strike,
-    so we deliberately don't fall back to it. Worst case (unparseable
-    symbol) we use ``fallback_strike``, which over-estimates collateral —
-    the safe direction.
-    """
-    sym = getattr(order, "symbol", "") or ""
-    strike: float
-    if len(sym) >= 15:
-        try:
-            strike = int(sym[-8:]) / 1000.0
-        except ValueError:
-            strike = fallback_strike
-    else:
-        strike = fallback_strike
-    qty = 1
-    try:
-        qty = int(float(order.qty))
-    except (TypeError, ValueError):
-        qty = 1
-    return strike * 100 * qty
-
-
 def has_cash_for_put(
     client: TradingClient,
     strike: float,
     contracts: int,
 ) -> tuple[bool, float, float]:
-    """Return ``(ok, available_after_reserves, needed)``.
+    """Return ``(ok, options_buying_power, needed)``.
 
-    ``ok`` is True iff our options buying power minus collateral already
-    reserved by every open put SELL (wheel-tagged OR foreign) covers the
-    proposed put's collateral.
+    ``options_buying_power`` reported by Alpaca already nets out collateral
+    pledged to short option positions (filled or working). Summing OPEN
+    orders on top of that would either:
+      - double-count working orders (Alpaca already reserves them in BP), OR
+      - miss freshly-filled puts (they've left the OPEN queue but the cash
+        is still pledged on the short position).
+
+    So we trust ``options_buying_power`` as the single source of truth and
+    just check whether it covers the proposed put's notional.
     """
     needed = strike * 100 * contracts
     try:
@@ -106,12 +58,7 @@ def has_cash_for_put(
     except APIError as exc:
         log.warning("get_account failed: %s; refusing to STO put", exc)
         return False, 0.0, needed
-    open_orders = client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))
-    reserved = sum(
-        _put_collateral(o, fallback_strike=strike) for o in open_orders if _is_put_sell(o)
-    )
-    available = options_bp - reserved
-    return available >= needed, available, needed
+    return options_bp >= needed, options_bp, needed
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +123,28 @@ def sto_put(
             f"insufficient options BP: need ${needed:.2f}, have ${available:.2f}",
         )
 
+    # Journal the intent BEFORE submitting. If we crash anywhere between
+    # submit() and save(), the next run's recover_orphan_intents() will see
+    # the order at Alpaca and reconcile it into state — no duplicate STO.
+    intent = {
+        "ticker": state.ticker,
+        "intent": "sto_put",
+        "client_order_id": coid,
+        "contract": {
+            "symbol": candidate.symbol,
+            "type": "put",
+            "strike": candidate.strike,
+            "expiration": candidate.expiration.isoformat(),
+            "premium_received": round(bid, 4),
+            "contracts": config.contracts_per_cycle,
+        },
+    }
+    try:
+        journal_intent(intent)
+    except OSError as exc:
+        log.warning("could not write pending-intent journal: %s; refusing to STO", exc)
+        return ExecAction(state.ticker, "error", f"journal write failed: {exc}")
+
     try:
         order = submit_option_limit_order(
             client,
@@ -188,6 +157,8 @@ def sto_put(
         )
     except APIError as exc:
         log.warning("STO put rejected for %s: %s", state.ticker, exc)
+        # Submission failed: the intent didn't become a real order, so drop it.
+        clear_intent(coid)
         return ExecAction(state.ticker, "error", f"alpaca rejected: {exc}")
 
     state.stage = Stage.PUT_OPEN
@@ -203,6 +174,9 @@ def sto_put(
     }
     if save is not None:
         save()
+    # Only clear the intent AFTER state has been persisted — if save() raises,
+    # the intent stays around and recovery will pick it up next run.
+    clear_intent(coid)
     return ExecAction(
         state.ticker,
         "sto_put",
@@ -260,14 +234,16 @@ def sto_call(
             f"CALL strike ${candidate.strike} < effective basis ${floor:.2f}; will not sell below basis",
         )
     bid = candidate.bid
+    # Order matters (mirrors sto_put): halted (bid<=0) check FIRST so we
+    # don't mis-classify a frozen chain as "low premium" and silently skip.
+    if bid <= 0:
+        return ExecAction(state.ticker, "halted", "CALL bid=0; chain halted/illiquid")
     if bid * 100 < config.min_premium_usd:
         return ExecAction(
             state.ticker,
             "skipped",
             f"CALL bid ${bid:.2f} below min premium",
         )
-    if bid <= 0:
-        return ExecAction(state.ticker, "halted", "CALL bid=0; chain halted/illiquid")
 
     coid = make_coid(WHEEL_PREFIX, state.ticker, "call")
     contracts = min(state.shares_held // 100, config.contracts_per_cycle)
@@ -278,6 +254,25 @@ def sto_call(
             f"dry-run STO call {candidate.symbol} x{contracts} @ ${bid:.2f}",
             client_order_id=coid,
         )
+
+    intent = {
+        "ticker": state.ticker,
+        "intent": "sto_call",
+        "client_order_id": coid,
+        "contract": {
+            "symbol": candidate.symbol,
+            "type": "call",
+            "strike": candidate.strike,
+            "expiration": candidate.expiration.isoformat(),
+            "premium_received": round(bid, 4),
+            "contracts": contracts,
+        },
+    }
+    try:
+        journal_intent(intent)
+    except OSError as exc:
+        log.warning("could not write pending-intent journal: %s; refusing to STO", exc)
+        return ExecAction(state.ticker, "error", f"journal write failed: {exc}")
 
     try:
         order = submit_option_limit_order(
@@ -291,6 +286,7 @@ def sto_call(
         )
     except APIError as exc:
         log.warning("STO call rejected for %s: %s", state.ticker, exc)
+        clear_intent(coid)
         return ExecAction(state.ticker, "error", f"alpaca rejected: {exc}")
 
     state.stage = Stage.CALL_OPEN
@@ -306,6 +302,7 @@ def sto_call(
     }
     if save is not None:
         save()
+    clear_intent(coid)
     return ExecAction(
         state.ticker,
         "sto_call",
@@ -390,19 +387,44 @@ def btc(
             client_order_id=coid,
         )
 
+    # Journal BEFORE submit so a crash between submit and save is recoverable.
+    limit_price = round(max(current_ask + 0.05, 0.01), 2)
+    intent = {
+        "ticker": state.ticker,
+        "intent": "btc",
+        "client_order_id": coid,
+        "symbol": symbol,
+        "contracts": contracts,
+        "limit_price": limit_price,
+    }
     try:
-        # Use market: at this point we've already decided closing is profitable,
-        # and parking a GTC limit at ask risks the option expiring unfilled.
-        order = submit_option_market_order(
+        journal_intent(intent)
+    except OSError as exc:
+        log.warning("could not write pending-intent journal: %s; refusing to BTC", exc)
+        return ExecAction(state.ticker, "error", f"journal write failed: {exc}")
+
+    try:
+        # We use a GTC LIMIT priced 5c above the current ask (a marketable
+        # limit that crosses the spread). Alpaca REJECTS option market orders
+        # with anything other than DAY tif (422 error), so the previous
+        # market+GTC code was silently broken in production. Using a limit
+        # at ask+5c gives us:
+        #   - off-hours queueing (GTC works on options when type=LIMIT)
+        #   - effectively-immediate fill when the market opens (it's 5c
+        #     through the ask, so any reasonable book will hit it)
+        # The 5c buffer absorbs typical bid/ask widening at the open.
+        order = submit_option_limit_order(
             client,
             option_symbol=symbol,
             qty=contracts,
             side=OrderSide.BUY,
+            limit_price=limit_price,
             time_in_force=TimeInForce.GTC,
             client_order_id=coid,
         )
     except APIError as exc:
         log.warning("BTC rejected for %s: %s", state.ticker, exc)
+        clear_intent(coid)
         # CRITICAL: leave state untouched so the next run retries from the
         # same stage. The active_contract is still valid.
         return ExecAction(state.ticker, "error", f"alpaca rejected: {exc}")
@@ -426,6 +448,7 @@ def btc(
     state.active_contract = None
     if save is not None:
         save()
+    clear_intent(coid)
     return ExecAction(
         state.ticker,
         "btc",

@@ -8,6 +8,7 @@ from alpaca.common.exceptions import APIError
 from alpaca.trading.enums import OrderSide
 from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
 
+import wheel_bot.state as state_mod
 from wheel_bot.config import WheelConfig
 from wheel_bot.executor import (
     btc,
@@ -19,6 +20,37 @@ from wheel_bot.executor import (
 )
 from wheel_bot.option_picker import OptionCandidate
 from wheel_bot.state import Stage, TickerState
+
+
+@pytest.fixture(autouse=True)
+def _isolate_pending_intents(tmp_path, monkeypatch):
+    """Redirect the executor's pending-intent journal to a per-test temp file
+    so tests don't leak state to the repo's real wheel_bot/state/ dir."""
+    monkeypatch.setattr(
+        state_mod, "PENDING_INTENTS_PATH", tmp_path / "pending_intents.json"
+    )
+    # The journal helpers default their `path` arg at definition time, so we
+    # also rebind them to versions that look at the patched path.
+    real_journal = state_mod.journal_intent
+    real_clear = state_mod.load_pending_intents.__wrapped__ if False else None
+    # Simpler: patch the helpers to use the new default path explicitly.
+    monkeypatch.setattr(
+        state_mod,
+        "journal_intent",
+        lambda intent, path=tmp_path / "pending_intents.json": real_journal(intent, path=path),
+    )
+    real_clear_fn = state_mod.clear_intent
+    monkeypatch.setattr(
+        state_mod,
+        "clear_intent",
+        lambda coid, path=tmp_path / "pending_intents.json": real_clear_fn(coid, path=path),
+    )
+    # Executor binds these at import time, so re-bind there too.
+    import wheel_bot.executor as exec_mod
+
+    monkeypatch.setattr(exec_mod, "journal_intent", state_mod.journal_intent)
+    monkeypatch.setattr(exec_mod, "clear_intent", state_mod.clear_intent)
+    yield
 
 
 def _config(**overrides) -> WheelConfig:
@@ -58,17 +90,6 @@ def _account(options_bp: float = 100_000):
     return a
 
 
-def _foreign_put_order(strike: float, qty: int = 1):
-    """An open put SELL we didn't tag (e.g. opened by hand)."""
-    o = MagicMock()
-    o.symbol = f"FOOX250620P{int(strike*1000):08d}"
-    o.side = "OrderSide.SELL"
-    o.qty = str(qty)
-    o.limit_price = str(strike)
-    o.client_order_id = "manual-12345"
-    return o
-
-
 # ---------------------------------------------------------------------------
 # Cash guard
 # ---------------------------------------------------------------------------
@@ -83,23 +104,36 @@ def test_has_cash_for_put_simple_pass():
     assert avail == 10_000
 
 
-def test_has_cash_for_put_subtracts_foreign_put_collateral():
+def test_has_cash_for_put_uses_options_buying_power_not_open_orders_sum():
+    """The previous impl summed up open put-SELL collateral and subtracted
+    that from options_buying_power. That was double-protective (Alpaca's BP
+    figure already nets working orders) AND double-broken (Alpaca's BP also
+    nets just-filled puts that have LEFT the OPEN queue). We trust
+    options_buying_power directly now; open orders don't enter the math."""
     client = MagicMock()
     client.get_account.return_value = _account(options_bp=10_000)
-    # An open put on FOOX at strike 60 reserves 60*100*1 = 6000.
-    client.get_orders.return_value = [_foreign_put_order(strike=60)]
+    # The open-orders list now plays no role; supply something nonzero to
+    # confirm we're NOT subtracting from it.
+    foreign = MagicMock()
+    foreign.symbol = "FOOX250620P00060000"
+    foreign.side = "OrderSide.SELL"
+    foreign.qty = "1"
+    client.get_orders.return_value = [foreign]
     ok, avail, needed = has_cash_for_put(client, strike=40, contracts=1)
-    assert avail == 10_000 - 6000
+    assert ok
+    assert avail == 10_000  # NOT 10000 - 6000
     assert needed == 4000
-    assert ok  # 4000 still fits
 
 
 def test_has_cash_for_put_refuses_when_underwater():
     client = MagicMock()
-    client.get_account.return_value = _account(options_bp=5_000)
-    client.get_orders.return_value = [_foreign_put_order(strike=60)]  # reserves 6000
-    ok, _avail, _needed = has_cash_for_put(client, strike=40, contracts=1)
+    # options_buying_power below the put's notional -> refuse.
+    client.get_account.return_value = _account(options_bp=3_000)
+    client.get_orders.return_value = []
+    ok, avail, needed = has_cash_for_put(client, strike=40, contracts=1)
     assert not ok
+    assert avail == 3_000
+    assert needed == 4_000
 
 
 # ---------------------------------------------------------------------------
@@ -129,10 +163,11 @@ def test_sto_put_submits_correct_limit_order_and_persists():
     saved.assert_called_once()
 
 
-def test_sto_put_refuses_when_cash_short_due_to_foreign_put():
+def test_sto_put_refuses_when_options_bp_too_low():
+    """options_buying_power below the put's notional -> skip with reason."""
     client = MagicMock()
-    client.get_account.return_value = _account(5_000)
-    client.get_orders.return_value = [_foreign_put_order(strike=60)]  # eats 6000
+    client.get_account.return_value = _account(3_000)
+    client.get_orders.return_value = []
     state = TickerState(ticker="PLTR", stage=Stage.IDLE)
     cand = _candidate(40, date.today() + timedelta(days=21), bid=1.10)
     action = sto_put(client, state, cand, _config())
@@ -224,6 +259,20 @@ def test_sto_call_skipped_for_disabled_ticker():
     client.submit_order.assert_not_called()
 
 
+def test_sto_call_returns_halted_when_bid_zero():
+    """Halt detection (bid<=0) MUST run before min-premium check, otherwise
+    a halted chain reports 'skipped: below min premium' and we miss the
+    operationally-meaningful 'halted' classification."""
+    client = MagicMock()
+    state = TickerState(ticker="PLTR", stage=Stage.HOLDING)
+    state.shares_held = 100
+    state.avg_basis_per_share = 40.0
+    cand = _candidate(45, date.today() + timedelta(days=21), type="call", bid=0.0)
+    action = sto_call(client, state, cand, _config())
+    assert action.action == "halted"
+    client.submit_order.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # BTC
 # ---------------------------------------------------------------------------
@@ -263,7 +312,15 @@ def test_should_close_skipped_when_not_decayed_enough():
     assert not do
 
 
-def test_btc_market_orders_and_updates_state():
+def test_btc_submits_limit_at_ask_plus_5c_gtc():
+    """BTC must use a GTC LIMIT priced ask+0.05, NOT a market order.
+
+    Alpaca rejects option market+GTC (422). Limit+GTC gives us off-hours
+    queueing; the +5c buffer crosses the spread so the order fills near
+    immediately when the market opens.
+    """
+    from alpaca.trading.enums import TimeInForce
+
     client = MagicMock()
     client.submit_order.return_value = MagicMock(id="ord-btc")
     state = TickerState(ticker="PLTR", stage=Stage.PUT_OPEN)
@@ -279,8 +336,10 @@ def test_btc_market_orders_and_updates_state():
     assert state.active_contract is None
     saved.assert_called_once()
     req = client.submit_order.call_args.args[0]
-    assert isinstance(req, MarketOrderRequest)
+    assert isinstance(req, LimitOrderRequest)
     assert req.side == OrderSide.BUY
+    assert req.time_in_force == TimeInForce.GTC
+    assert float(req.limit_price) == pytest.approx(0.45)  # ask + 0.05
 
 
 def test_btc_call_transitions_to_holding_and_credits_lot_premium():

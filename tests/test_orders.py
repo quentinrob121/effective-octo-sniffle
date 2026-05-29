@@ -66,8 +66,11 @@ def test_bracket_order_stop_limit_leg():
     assert float(req.stop_loss.limit_price) == 139
 
 
-def test_option_market_order_defaults_to_gtc():
-    # Option decisions are made off-hours by cron, so DAY would be rejected.
+def test_option_market_order_defaults_to_day():
+    """Alpaca REJECTS option market orders with anything but DAY tif (422).
+    We default to DAY so callers don't accidentally trigger that rejection;
+    callers needing off-hours queueing must use a LIMIT (GTC works there).
+    """
     req = _captured_request(
         orders.submit_option_market_order,
         "PLTR250620P00040000",
@@ -77,6 +80,20 @@ def test_option_market_order_defaults_to_gtc():
     assert isinstance(req, MarketOrderRequest)
     assert req.symbol == "PLTR250620P00040000"
     assert req.side == OrderSide.SELL
+    assert req.time_in_force == TimeInForce.DAY
+
+
+def test_option_limit_order_defaults_to_gtc():
+    """LIMIT options orders can be GTC; this is the workhorse for our wheel
+    bot which schedules off-hours but wants the order to live until filled."""
+    req = _captured_request(
+        orders.submit_option_limit_order,
+        "PLTR250620P00040000",
+        1,
+        OrderSide.SELL,
+        limit_price=1.00,
+    )
+    assert isinstance(req, LimitOrderRequest)
     assert req.time_in_force == TimeInForce.GTC
 
 

@@ -125,15 +125,15 @@ def submit_option_market_order(
     option_symbol: str,
     qty: float,
     side: OrderSide,
-    time_in_force: TimeInForce = TimeInForce.GTC,
+    time_in_force: TimeInForce = TimeInForce.DAY,
     client_order_id: str | None = None,
 ) -> Order:
     """Market order on an OCC option symbol (e.g. ``PLTR250620P00040000``).
 
-    Defaults to ``GTC`` rather than ``DAY`` because option decisions are often
-    made outside RTH (cron schedules, after-hours reconciliation) and a DAY
-    order placed off-hours would be rejected. Callers that want DAY behaviour
-    pass it explicitly.
+    Defaults to ``DAY`` because Alpaca REJECTS option market orders with any
+    ``time_in_force`` other than DAY. (This is an Alpaca-side rule, not a
+    Pythonic preference — submitting GTC + market on options returns 422.)
+    Use ``submit_option_limit_order`` (GTC-capable) for off-hours queueing.
     """
     request = MarketOrderRequest(
         symbol=option_symbol,

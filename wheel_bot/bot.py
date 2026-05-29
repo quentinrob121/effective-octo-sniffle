@@ -19,9 +19,16 @@ from alpaca.trading.enums import ContractType
 from alpaca_starter import build_data_client, build_trading_client, load_settings
 
 from .config import WheelConfig, load_config
-from .executor import ExecAction, btc, should_close, sto_call, sto_put
+from .executor import (
+    ExecAction,
+    btc,
+    effective_basis_per_share,
+    should_close,
+    sto_call,
+    sto_put,
+)
 from .option_picker import OptionCandidate, pick_expiration, pick_strike
-from .reconciler import ReconcileResult, reconcile_ticker
+from .reconciler import ReconcileResult, recover_orphan_intents, reconcile_ticker
 from .state import (
     STATE_PATH,
     SUMMARIES_DIR,
@@ -226,10 +233,24 @@ def _handle_holding(
     today: date,
     save: callable,
 ) -> ExecAction:
+    """Pick a covered-call strike ABOVE EFFECTIVE BASIS, not above spot.
+
+    Spec rule: "sell calls 10% above what I paid". If we anchored to spot
+    and spot has fallen 20% since assignment, the picker would target a
+    strike right around our basis — i.e. a guaranteed flat lot if called
+    away, defeating the wheel's premium-collection thesis. By anchoring on
+    ``effective_basis_per_share`` (cost minus all call premium already
+    collected against this lot) we honor the spec and protect the lot.
+
+    Spot is still queried solely as a health check that we have a live
+    quote; it does NOT feed the strike calculation. The executor's
+    ``floor < basis`` guard remains as a second line of defense.
+    """
     spot = _spot_price(stock_client, state.ticker)
     if spot is None or spot <= 0:
         return ExecAction(state.ticker, "skipped", "no spot quote")
-    target_strike = spot * (1 + config.call_strike_offset_pct / 100.0)
+    basis = effective_basis_per_share(state)
+    target_strike = basis * (1 + config.call_strike_offset_pct / 100.0)
     chain = _fetch_chain(option_client, state.ticker, ContractType.CALL, today, config.dte_max)
     if not chain:
         return ExecAction(state.ticker, "skipped", "empty call chain")
@@ -300,6 +321,27 @@ def run_once(config: WheelConfig | None = None) -> RunResult:
     actions: list[ExecAction] = []
     holds: list[str] = []
 
+    # Orphan-intent recovery: if last run crashed between submit() and save(),
+    # the journal has the order's client_order_id. Reconcile any such orders
+    # into state BEFORE per-ticker reconcile, so the rest of this run sees the
+    # truth (and we don't accidentally STO a duplicate). The journal is then
+    # cleared whether the order existed or not.
+    try:
+        orphan_recs = recover_orphan_intents(trading_client, state)
+    except APIError as exc:
+        log.warning("orphan-intent recovery failed: %s", exc)
+        orphan_recs = []
+    if orphan_recs:
+        save_state(state)
+        for r in orphan_recs:
+            append_audit({
+                "ticker": r.ticker,
+                "kind": "orphan_recovery",
+                "transition": r.transition,
+                "detail": r.detail,
+            })
+        reconciliations.extend(orphan_recs)
+
     for ticker in config.tickers:
         ts = state.get_or_create(ticker)
         # ---- reconcile first
@@ -366,22 +408,131 @@ def summarize(result: RunResult) -> str:
     return msg
 
 
-def write_daily_summary(result: RunResult, today: date | None = None) -> Path:
-    """Write a per-day markdown summary under wheel_bot/state/summaries/.
+def total_return(
+    state: WheelState,
+    spot_lookup: callable | None = None,
+) -> dict:
+    """Compute realized + unrealized P&L across all wheel tickers.
 
-    Idempotent: appends a new section if today's file already exists, so
-    multiple intraday runs accumulate into one daily report.
+    Realized   = lifetime premium collected + sum of called-away lot P&L
+                 from the cycles log (which already records `lot_pnl`).
+    Unrealized = for each HOLDING ticker, (spot - effective_basis) * shares.
+                 ``spot_lookup(ticker)`` should return current spot or None.
+
+    Returns a dict with realized, unrealized, total, and a per-ticker breakdown
+    so the summary can render the details inline.
     """
+    realized = 0.0
+    unrealized = 0.0
+    per_ticker: dict[str, dict] = {}
+    for ticker, ts in state.tickers.items():
+        ticker_realized = float(ts.cumulative_premium_lifetime or 0.0)
+        called_away_pnl = 0.0
+        for cycle in ts.cycles or []:
+            if cycle.get("kind") == "called_away":
+                # ``lot_pnl`` already includes the (strike - basis + lot_prem) *
+                # shares math; don't double-count the premium portion (it's not
+                # in cumulative_premium_lifetime — that's only put premium and
+                # call premium realized via BTC).
+                called_away_pnl += float(cycle.get("lot_pnl", 0.0) or 0.0)
+        realized_for_ticker = ticker_realized + called_away_pnl
+        realized += realized_for_ticker
+
+        ticker_unrealized = 0.0
+        if ts.stage in (Stage.HOLDING, Stage.CALL_OPEN) and ts.shares_held > 0:
+            spot = spot_lookup(ticker) if spot_lookup else None
+            if spot is not None and spot > 0:
+                eff_basis = ts.avg_basis_per_share - ts.cumulative_premium_this_lot
+                ticker_unrealized = (float(spot) - eff_basis) * ts.shares_held
+                unrealized += ticker_unrealized
+        per_ticker[ticker] = {
+            "realized": round(realized_for_ticker, 2),
+            "unrealized": round(ticker_unrealized, 2),
+            "stage": ts.stage.value,
+            "shares": ts.shares_held,
+            "basis": ts.avg_basis_per_share,
+        }
+    return {
+        "realized": round(realized, 2),
+        "unrealized": round(unrealized, 2),
+        "total": round(realized + unrealized, 2),
+        "per_ticker": per_ticker,
+    }
+
+
+def daily_summary_markdown(
+    state: WheelState,
+    result: RunResult,
+    today: date | None = None,
+    spot_lookup: callable | None = None,
+    positions: list | None = None,
+) -> str:
+    """Render the daily summary markdown body. Pure function so tests don't
+    need to touch disk."""
     today = today or datetime.now(timezone.utc).date()
-    SUMMARIES_DIR.mkdir(parents=True, exist_ok=True)
-    out = SUMMARIES_DIR / f"{today.isoformat()}.md"
-    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    lines = [f"## Run at {ts}", ""]
-    lines.append("### Reconciliations")
+    ts_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    returns = total_return(state, spot_lookup=spot_lookup)
+
+    lines: list[str] = [f"## Run at {ts_iso}", ""]
+
+    lines.append("### Per-ticker state")
+    if not state.tickers:
+        lines.append("- (no tickers tracked yet)")
+    else:
+        lines.append("| Ticker | Stage | Shares | Basis | Lot call prem ($/sh) | Active contract |")
+        lines.append("|---|---|---|---|---|---|")
+        for ticker in sorted(state.tickers):
+            t = state.tickers[ticker]
+            active = "—"
+            if t.active_contract:
+                c = t.active_contract
+                active = (
+                    f"{c.get('symbol')} strike=${c.get('strike')} "
+                    f"exp={c.get('expiration')} prem=${c.get('premium_received')}"
+                )
+            lines.append(
+                f"| {ticker} | {t.stage.value} | {t.shares_held} | "
+                f"${t.avg_basis_per_share:.4f} | "
+                f"${t.cumulative_premium_this_lot:.4f} | {active} |"
+            )
+    lines.append("")
+
+    lifetime = sum(
+        float(t.cumulative_premium_lifetime or 0.0) for t in state.tickers.values()
+    )
+    lines.append(f"### Lifetime premium collected: ${lifetime:.2f}")
+    lines.append("")
+
+    lines.append("### Positions")
+    if positions:
+        lines.append("| Symbol | Side | Qty | Avg entry | Market value | Unrealized P/L |")
+        lines.append("|---|---|---|---|---|---|")
+        for p in positions:
+            lines.append(
+                f"| {getattr(p, 'symbol', '?')} | {getattr(p, 'side', '?')} | "
+                f"{getattr(p, 'qty', '?')} | {getattr(p, 'avg_entry_price', '?')} | "
+                f"{getattr(p, 'market_value', '?')} | {getattr(p, 'unrealized_pl', '?')} |"
+            )
+    else:
+        lines.append("- (no live positions reported)")
+    lines.append("")
+
+    lines.append(
+        f"### Total return: ${returns['total']:.2f} "
+        f"(realized ${returns['realized']:.2f} + unrealized ${returns['unrealized']:.2f})"
+    )
+    lines.append("")
+
+    lines.append("### Today's reconciliations")
+    if not result.reconciliations:
+        lines.append("- (none)")
     for r in result.reconciliations:
         lines.append(f"- {r.ticker}: {r.transition} — {r.detail}")
     lines.append("")
-    lines.append("### Actions")
+
+    lines.append("### Today's actions")
+    if not result.actions:
+        lines.append("- (none)")
     for a in result.actions:
         lines.append(f"- {a.ticker}: {a.action} — {a.detail}")
     if result.holds:
@@ -390,8 +541,35 @@ def write_daily_summary(result: RunResult, today: date | None = None) -> Path:
         for h in result.holds:
             lines.append(f"- {h}")
     lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def write_daily_summary(
+    result: RunResult,
+    today: date | None = None,
+    state: WheelState | None = None,
+    spot_lookup: callable | None = None,
+    positions: list | None = None,
+) -> Path:
+    """Write a per-day markdown summary under wheel_bot/state/summaries/.
+
+    Idempotent: appends a new section if today's file already exists, so
+    multiple intraday runs accumulate into one daily report.
+
+    Includes per-ticker state, lifetime premium, live positions, total
+    return (realized + unrealized), and the run's reconciliations/actions
+    — i.e. every field the spec calls for.
+    """
+    today = today or datetime.now(timezone.utc).date()
+    SUMMARIES_DIR.mkdir(parents=True, exist_ok=True)
+    out = SUMMARIES_DIR / f"{today.isoformat()}.md"
+    if state is None:
+        state = load_state()
+    body = daily_summary_markdown(
+        state, result, today=today, spot_lookup=spot_lookup, positions=positions
+    )
     existing = out.read_text() if out.exists() else f"# Wheel summary {today.isoformat()}\n\n"
-    out.write_text(existing + "\n".join(lines) + "\n")
+    out.write_text(existing + body)
     return out
 
 

@@ -39,20 +39,67 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_summary(_: argparse.Namespace) -> int:
-    # Re-run with no orders just to capture the current snapshot for the
-    # markdown summary; flag dry-run to be safe.
+    """Write today's markdown summary AND print it to stdout.
+
+    The markdown includes per-ticker state, lifetime premium, live Alpaca
+    positions, total return (realized + unrealized), and any reconciliations/
+    actions from earlier runs today. Safe to call multiple times — each
+    invocation appends a new "Run at ..." section to today's file.
+    """
     from datetime import datetime, timezone
+
+    from .bot import RunResult
 
     state = load_state()
     today = datetime.now(timezone.utc).date()
-    # If nothing happened yet today, write a stub so the workflow can still
-    # always commit something predictable.
-    from .bot import RunResult
-
     result = RunResult(reconciliations=[], actions=[], holds=[])
-    path = write_daily_summary(result, today)
+
+    # Best-effort live data lookups for the markdown. If Alpaca is down we
+    # still write a useful summary using just stored state.
+    spot_lookup = None
+    positions: list = []
+    try:
+        from alpaca.data.requests import StockLatestQuoteRequest
+
+        from .bot import _build_option_data_client  # noqa: F401 — module init
+        from alpaca_starter import build_data_client
+
+        client = build_trading_client()
+        try:
+            positions = client.get_all_positions() or []
+        except Exception as exc:  # noqa: BLE001 — never crash the summary
+            print(f"# warning: could not load live positions: {exc}")
+        stock_client = build_data_client()
+
+        def _spot(ticker: str) -> float | None:
+            try:
+                quotes = stock_client.get_stock_latest_quote(
+                    StockLatestQuoteRequest(symbol_or_symbols=ticker)
+                )
+            except Exception:  # noqa: BLE001
+                return None
+            q = quotes.get(ticker) if isinstance(quotes, dict) else None
+            if q is None:
+                return None
+            try:
+                bid = float(q.bid_price or 0)
+                ask = float(q.ask_price or 0)
+            except (TypeError, ValueError):
+                return None
+            if bid > 0 and ask > 0:
+                return (bid + ask) / 2
+            return ask or bid or None
+
+        spot_lookup = _spot
+    except Exception as exc:  # noqa: BLE001 — keep summary working offline
+        print(f"# warning: live data unavailable: {exc}")
+
+    path = write_daily_summary(
+        result, today, state=state, spot_lookup=spot_lookup, positions=positions
+    )
     print(f"summary written to {path}")
     print()
+    print(path.read_text())
     print(render_status(state))
     return 0
 
