@@ -1,0 +1,101 @@
+name: Copy Trade
+
+# Runs the politician-mirror bot on a schedule (and on-demand). The container
+# this runs in is ephemeral, so the bot relies on `state/processed_trades.json`
+# being committed back after each run to avoid replaying old disclosures.
+
+on:
+  schedule:
+    # Hourly during US equity market hours, Monday-Friday. GitHub cron is UTC
+    # only, and NYSE shifts by an hour twice a year:
+    #   EDT (DST, Mar-Nov): 09:30-16:00 ET = 13:30-20:00 UTC
+    #   EST (Nov-Mar):      09:30-16:00 ET = 14:30-21:00 UTC
+    # We schedule across the union of both windows; the dedupe state stops any
+    # extra ticks from replaying disclosures, and the cost of an idle run is ~0.
+    - cron: "30 13 * * 1-5"
+    - cron: "0 14-21 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Preview only - do not place orders"
+        type: boolean
+        default: false
+      enable_ladder:
+        description: "Drop a dip-ladder under each mirror-buy"
+        type: boolean
+        default: false
+
+# Single run at a time. If a long run overlaps the next cron tick, the new one waits.
+concurrency:
+  group: copy-trade
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Use the branch the bot lives on so state commits stay with the bot.
+          ref: ${{ github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run copy-trade cycle
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
+          ALPACA_BASE_URL: ${{ secrets.ALPACA_BASE_URL || 'https://paper-api.alpaca.markets/v2' }}
+          COPY_POLITICIAN_ID: ${{ vars.COPY_POLITICIAN_ID || 'M001236' }}
+          COPY_POLITICIAN_NAME: ${{ vars.COPY_POLITICIAN_NAME || 'Tim Moore' }}
+          COPY_TRADE_USD: ${{ vars.COPY_TRADE_USD || '500' }}
+          COPY_MAX_TRADE_USD: ${{ vars.COPY_MAX_TRADE_USD || '2000' }}
+          COPY_SKIP_OLDER_THAN_DAYS: ${{ vars.COPY_SKIP_OLDER_THAN_DAYS || '90' }}
+          # Ladder toggle: workflow_dispatch input wins; otherwise repo variable.
+          COPY_ENABLE_LADDER: ${{ inputs.enable_ladder && 'true' || (vars.COPY_ENABLE_LADDER || 'false') }}
+          COPY_LADDER_MAX_USD: ${{ vars.COPY_LADDER_MAX_USD || '30000' }}
+          COPY_DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+        run: python -m copy_trading_bot -v run
+
+      - name: Commit updated state
+        # Always run, even if the cycle step failed mid-loop: bot.py persists
+        # processed trades to disk per-trade, and we must commit them or the
+        # next run will duplicate the orders we already submitted.
+        if: always()
+        # Only commit if processed_trades.json actually changed. Rebase before
+        # pushing so an unrelated commit on the branch (e.g. a manual edit)
+        # doesn't fail the push. Retry up to 3x if the push races a concurrent push.
+        run: |
+          if git diff --quiet -- copy_trading_bot/state/processed_trades.json; then
+            echo "No state changes to commit."
+            exit 0
+          fi
+          git config user.name "copy-trade-bot"
+          git config user.email "copy-trade-bot@users.noreply.github.com"
+          git add copy_trading_bot/state/processed_trades.json
+          git commit -m "chore(copy-trade): record processed trades"
+          branch="${GITHUB_REF_NAME}"
+          for attempt in 1 2 3; do
+            git pull --rebase --autostash origin "$branch" || true
+            if git push origin "HEAD:$branch"; then
+              exit 0
+            fi
+            echo "Push attempt $attempt failed; retrying..."
+            sleep $((attempt * 3))
+          done
+          echo "::warning::Failed to push state commit after 3 attempts."
+          exit 1

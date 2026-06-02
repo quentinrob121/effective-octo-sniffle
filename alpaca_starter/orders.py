@@ -120,6 +120,53 @@ def submit_bracket_order(
     return client.submit_order(request)
 
 
+def submit_option_market_order(
+    client: TradingClient,
+    option_symbol: str,
+    qty: float,
+    side: OrderSide,
+    time_in_force: TimeInForce = TimeInForce.DAY,
+    client_order_id: str | None = None,
+) -> Order:
+    """Market order on an OCC option symbol (e.g. ``PLTR250620P00040000``).
+
+    Defaults to ``DAY`` because Alpaca REJECTS option market orders with any
+    ``time_in_force`` other than DAY. (This is an Alpaca-side rule, not a
+    Pythonic preference — submitting GTC + market on options returns 422.)
+    Use ``submit_option_limit_order`` (GTC-capable) for off-hours queueing.
+    """
+    request = MarketOrderRequest(
+        symbol=option_symbol,
+        qty=qty,
+        side=side,
+        time_in_force=time_in_force,
+        client_order_id=client_order_id,
+    )
+    return client.submit_order(request)
+
+
+def submit_option_limit_order(
+    client: TradingClient,
+    option_symbol: str,
+    qty: float,
+    side: OrderSide,
+    limit_price: float,
+    time_in_force: TimeInForce = TimeInForce.GTC,
+    client_order_id: str | None = None,
+) -> Order:
+    """Limit order on an OCC option symbol. See ``submit_option_market_order``
+    for the rationale on GTC being the default time-in-force."""
+    request = LimitOrderRequest(
+        symbol=option_symbol,
+        qty=qty,
+        side=side,
+        time_in_force=time_in_force,
+        limit_price=limit_price,
+        client_order_id=client_order_id,
+    )
+    return client.submit_order(request)
+
+
 def list_open_orders(client: TradingClient) -> list[Order]:
     from alpaca.trading.enums import QueryOrderStatus
 

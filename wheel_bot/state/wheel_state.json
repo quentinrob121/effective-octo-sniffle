@@ -1,0 +1,37 @@
+{
+  "tickers": {
+    "HOOD": {
+      "active_contract": null,
+      "avg_basis_per_share": 0.0,
+      "cumulative_premium_lifetime": 0.0,
+      "cumulative_premium_this_lot": 0.0,
+      "cycles": [],
+      "enabled": true,
+      "shares_held": 0,
+      "stage": "IDLE",
+      "ticker": "HOOD"
+    },
+    "NANC": {
+      "active_contract": null,
+      "avg_basis_per_share": 0.0,
+      "cumulative_premium_lifetime": 0.0,
+      "cumulative_premium_this_lot": 0.0,
+      "cycles": [],
+      "enabled": true,
+      "shares_held": 0,
+      "stage": "IDLE",
+      "ticker": "NANC"
+    },
+    "PLTR": {
+      "active_contract": null,
+      "avg_basis_per_share": 0.0,
+      "cumulative_premium_lifetime": 0.0,
+      "cumulative_premium_this_lot": 0.0,
+      "cycles": [],
+      "enabled": true,
+      "shares_held": 0,
+      "stage": "IDLE",
+      "ticker": "PLTR"
+    }
+  }
+}
