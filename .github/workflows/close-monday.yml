@@ -1,0 +1,104 @@
+name: Close Monday
+
+# One-shot helper to close TSM, TSLA, COIN at Monday's open after their
+# PENDING_CANCEL breakeven limits clear. Fires automatically at Monday 13:30
+# UTC (9:30 ET during EDT) and also via workflow_dispatch. Idempotent: if a
+# position no longer exists, the close is a no-op and the workflow exits clean.
+#
+# Once you've confirmed the closes filled, delete this workflow file.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: "Comma-separated tickers to close"
+        default: "TSM,TSLA,COIN"
+  schedule:
+    # Monday 13:30 UTC = 09:30 ET during EDT (the next scheduled US market open
+    # at time of writing). If still pending after that, dispatch manually.
+    - cron: "30 13 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: close-monday
+  cancel-in-progress: false
+
+jobs:
+  close:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Close positions
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
+          ALPACA_BASE_URL: ${{ secrets.ALPACA_BASE_URL || 'https://paper-api.alpaca.markets/v2' }}
+          TICKERS: ${{ inputs.tickers || 'TSM,TSLA,COIN' }}
+        run: |
+          python <<'PY'
+          import os, time
+          from alpaca.common.exceptions import APIError
+          from alpaca.trading.client import TradingClient
+          from alpaca.trading.enums import QueryOrderStatus
+          from alpaca.trading.requests import GetOrdersRequest
+
+          client = TradingClient(
+              api_key=os.environ['ALPACA_API_KEY'],
+              secret_key=os.environ['ALPACA_API_SECRET'],
+              paper="paper-api" in os.environ.get('ALPACA_BASE_URL', ''),
+          )
+          tickers = [t.strip().upper() for t in os.environ['TICKERS'].split(',') if t.strip()]
+          print(f"closing: {tickers}")
+
+          # Step 1: cancel any open sells holding the shares.
+          for t in tickers:
+              for o in client.get_orders(
+                  GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[t])
+              ):
+                  if str(o.side).endswith("SELL"):
+                      try:
+                          client.cancel_order_by_id(o.id)
+                          print(f"  {t}: cancel sent {o.order_type} {str(o.id)[:8]}")
+                      except APIError as e:
+                          print(f"  {t}: cancel failed: {e}")
+
+          # Step 2: poll each ticker, close once held_for_orders clears.
+          for t in tickers:
+              # Skip if there is no open position to close.
+              try:
+                  client.get_open_position(t)
+              except APIError as e:
+                  if getattr(e, 'status_code', None) == 404:
+                      print(f"  {t}: no open position, skipping")
+                      continue
+                  raise
+              for attempt in range(60):  # up to 5 min per ticker
+                  try:
+                      r = client.close_position(t)
+                      print(f"  {t}: close submitted id={str(r.id)[:8]} status={r.status} qty={r.qty}")
+                      break
+                  except APIError as e:
+                      msg = str(e)
+                      if 'insufficient qty' in msg:
+                          time.sleep(5)
+                          continue
+                      print(f"  {t}: close failed: {e}")
+                      break
+              else:
+                  print(f"  {t}: still blocked after 5 min, giving up")
+          PY
